@@ -1,0 +1,262 @@
+#! /usr/bin/env python
+# coding: utf-8
+import os, sys
+sys.path.insert(0, os.path.dirname(__file__))
+# print('system path: {}  {}'.format(sys.path, os.path.dirname(__file__)))
+import numpy as np
+import cv2 as cv
+import mxnet as mx
+from mxnet import autograd
+import mxnet.ndarray as nd
+from config.config_v3 import Config
+# import log.logger.Logger as logger
+import device_control.device_info as DeviceInfo
+from dataset.mx_data_iter_v1 import RecDataIterV1
+import time
+from metric.mx_rmse_metric import RMSE
+from metric.metrics import BaseMetric
+from log.logger import Logger as logger
+from network.facial_landmark_v1 import resnet18_v2
+from loss.L2Loss import L2Loss
+from network.mobilenet import get_mobilenet_v2
+
+
+def acc(preds, targets):
+    preds = preds.as_in_context(mx.cpu()).asnumpy()
+    exp_ret = np.exp(preds)
+    sum_ret = np.sum(exp_ret, axis=1, keepdims=True)
+    softmax_predict = exp_ret /sum_ret
+    preds_idx = softmax_predict.argmax(axis=1)
+    correct = preds_idx == targets.as_in_context(mx.cpu()).asnumpy()
+    correct_count = correct.sum()
+    return correct_count, preds.shape(0)
+
+def learning_rate_schedule(epoch, start_epoch, learning_rate):
+    if learning_rate < 1e-6:
+        return learning_rate
+    if (epoch - start_epoch) < 3:
+        return learning_rate
+    if (epoch - start_epoch) % 2 == 0:
+        return learning_rate * 0.1
+    return learning_rate
+
+def train_v1(opts):
+
+    ## log
+
+    ## devices
+    devices = DeviceInfo.get_devices([int(i) for i in opts.processors.split(',')])
+    logger.info('devices: {}'.format(devices))
+
+    ## metric
+    rmse = RMSE()
+    loss_metric = [BaseMetric(name='loss')]
+    loss_metric.append(BaseMetric('l1'))
+    loss_metric.append(BaseMetric('l2'))
+    loss_metric.append(BaseMetric('l3'))
+    loss_metric.append(BaseMetric('l4'))
+    loss_metric.append(BaseMetric('l5'))
+    loss_metric.append(BaseMetric('l6'))
+    loss_metric.append(BaseMetric('l7'))
+
+    ## network
+    # net = resnet18_v2(classes=136)
+    net = get_mobilenet_v2(multiplier=1.0, classes=136)
+    # net.hybridize()
+    net.initialize(init=mx.init.Normal(sigma=0.01), force_reinit=True)
+    if opts.pretrained_name is not None and opts.pretrained_dir is not None:
+        logger.info('loading pre-trained {} ...'.format(os.path.join(opts.pretrained_dir, opts.pretrained_name)))
+        net.load_params(
+            os.path.join(opts.pretrained_dir, opts.pretrained_name),
+            ctx=devices,
+            allow_missing=True
+        )
+        logger.info('load pre-trained model complete.')
+    net.collect_params().reset_ctx(devices)
+    logger.info('net: {}'.format(net))
+
+    ## loss
+    loss_funcs = []
+    # loss_funcs.append(mx.gluon.loss.SoftmaxCrossEntropyLoss())
+    loss_funcs.append(mx.gluon.loss.L1Loss())
+    # loss_funcs.append(mx.gluon.loss.L2Loss())
+    # loss_funcs.append(L2Loss())
+
+    ## optimizer
+    lr_scheduler = mx.lr_scheduler.FactorScheduler(step=3, factor=0.1, base_lr=opts.learning_rate)
+
+    ## trainer
+    trainer = mx.gluon.Trainer(
+        net.collect_params(),
+        opts.optimizer,
+        {
+            'learning_rate': opts.learning_rate,
+            # 'momentum': opts,
+            'wd': opts.weight_decay
+            # 'lr_scheduler': lr_scheduler
+        }
+    )
+
+
+    ## datsets
+    logger.info('loading datasets ...')
+    train_iter = RecDataIterV1(
+        rec_dir=opts.rec_dir,
+        rec_prefix=opts.rec_prefix,
+        batch_size=opts.batch_size,
+        shuffle=opts.shuffle
+    )
+    logger.info('load datasets complete.')
+
+    params = net.collect_params()
+    param_names = params.keys()
+
+    logger.info(
+        'starting training ...',
+        show_type=logger.LOG_STYLE.DEFAULT,
+        forground=logger.LOG_FRONT_COLOR.RED,
+        background=logger.LOG_BACK_COLOR.DEFAULT
+    )
+    start_time = time.time()
+    global_step = 0
+    for epoch in range(opts.min_epoch, opts.max_epoch):
+        for idx_step, batch_data in enumerate(iter(train_iter)):
+            datas = mx.gluon.utils.split_and_load(
+                batch_data.data[0],
+                ctx_list=devices,
+                batch_axis=0
+            )
+            targets = mx.gluon.utils.split_and_load(
+                batch_data.label[0],
+                ctx_list=devices,
+                batch_axis=0
+            )
+            losses = []
+            with mx.autograd.record():
+                for datai, targeti in zip(datas, targets):
+                    # print('[===]  datai: {}  {}  {}'.format(datai.shape, datai.dtype, type(datai)))
+                    # print('[===]  targeti: {}  {}  {}'.format(targeti.shape, targeti.dtype, type(targeti)))
+                    datai = datai / 255.0
+                    # predicts = net(datai)
+                    predicts = net(datai)
+                    # logger.info('predicts: {}  {}, {}  {}'.format(
+                    #     type(predicts), predicts.shape, mx.nd.max(predicts), mx.nd.min(predicts)
+                    # ))
+
+                    targeti = targeti / 128.0
+                    # print('[===] targeti min-max: {}  {}'.format(mx.nd.max(targeti[0, :]).asnumpy()[0], mx.nd.min(targeti[0, :]).asnumpy()[0]))
+                    # print('[===] predicts min-max: {}  {}'.format(mx.nd.max(predicts[0, :]).asnumpy()[0], mx.nd.min(predicts[0, :]).asnumpy()[0]))
+                    mse_loss1 = loss_funcs[0](targeti, predicts[0])
+                    mse_loss2 = loss_funcs[0](targeti[:, 0:34], predicts[1])
+                    mse_loss3 = loss_funcs[0](targeti[:, 34:44], predicts[2])
+                    mse_loss4 = loss_funcs[0](targeti[:, 44:54], predicts[3])
+                    mse_loss5 = loss_funcs[0](targeti[:, 54:72], predicts[4])
+                    mse_loss6 = loss_funcs[0](targeti[:, 72:84], predicts[5])
+                    mse_loss7 = loss_funcs[0](targeti[:, 84:96], predicts[6])
+                    mse_loss8 = loss_funcs[0](targeti[:, 96:136], predicts[7])
+                    mse_loss = mse_loss1+mse_loss2+mse_loss3+mse_loss4+mse_loss5+mse_loss6+mse_loss7+mse_loss8
+                    losses.extend(mse_loss)
+                    # print('target: {}'.format(targeti))
+                    # print('predicts: {}'.format(predicts))
+                    # print('loss: {}'.format(mse_loss.shape))
+                    # print('[===] {}'.format(mse_loss))
+
+                    # correct_count, num_samples = acc(preds=predicts, targets=targeti)
+
+                    ## update metrics
+                    loss_metric[0].update(mse_loss.shape[0], mse_loss.asnumpy().sum())
+                    loss_metric[1].update(mse_loss1.shape[0], mse_loss1.asnumpy().sum())
+                    loss_metric[2].update(mse_loss2.shape[0], mse_loss2.asnumpy().sum())
+                    loss_metric[3].update(mse_loss3.shape[0], mse_loss3.asnumpy().sum())
+                    loss_metric[4].update(mse_loss4.shape[0], mse_loss4.asnumpy().sum())
+                    loss_metric[5].update(mse_loss5.shape[0], mse_loss5.asnumpy().sum())
+                    loss_metric[6].update(mse_loss6.shape[0], mse_loss6.asnumpy().sum())
+                    loss_metric[7].update(mse_loss7.shape[0], mse_loss7.asnumpy().sum())
+
+            mx.autograd.backward(losses)
+            # for loss in losses:
+            #     loss.backward()
+            #     mx.autograd.backward(loss)
+            trainer.step(batch_data.data[0].shape[0])
+            mx.nd.waitall()
+
+            ## log
+            elapse_time = time.time() - start_time
+            samples_per_second = 0
+            if global_step > 30:
+                start_time = time.time()
+                samples_per_second = int(opts.batch_size * opts.checkpoint_interval / elapse_time)
+            if (global_step + 1) % opts.log_interval == 0:
+                logger.info('[{}/{}][{}/{}] [loss: {:.6f} / {:.6f} / {:.4f} / {:.4f} / {:.4f} / {:.4f} / {:.4f} / {:.4f} / {:.4f}]  [{} samples/s]  [lr: {:.10f}]'.format(
+                    epoch,
+                    opts.max_epoch-opts.min_epoch,
+                    idx_step,
+                    int(train_iter.max_index/opts.batch_size),
+                    loss_metric[0].get_avg()[0],
+                    loss_metric[0].get_avg()[1],
+                    loss_metric[1].get_avg()[0],
+                    loss_metric[2].get_avg()[0],
+                    loss_metric[3].get_avg()[0],
+                    loss_metric[4].get_avg()[0],
+                    loss_metric[5].get_avg()[0],
+                    loss_metric[6].get_avg()[0],
+                    loss_metric[7].get_avg()[0],
+                    samples_per_second,
+                    lr_scheduler.base_lr
+                ))
+
+            ## update metrics
+
+            ## update global step
+            global_step += 1
+
+        ## update trainer
+        train_iter.reset()
+
+        ## update learning rate
+        lr_scheduler(epoch - opts.min_epoch)
+        trainer.set_learning_rate(lr_scheduler.base_lr)
+        print('lr: ', lr_scheduler.base_lr, epoch - opts.min_epoch)
+
+        ## save checkpoint
+        if (epoch + 1) % opts.checkpoint_interval == 0:
+            checkpoint_path = os.path.join(
+                opts.checkpoint_dir,
+                opts.checkpoint_prefix+'{}'.format(epoch)
+            )
+            logger.info(
+                'begin save checkpoints {} ...'.format(checkpoint_path),
+                show_type=logger.LOG_STYLE.DEFAULT,
+                forground=logger.LOG_FRONT_COLOR.RED,
+                background=logger.LOG_BACK_COLOR.DEFAULT
+            )
+            net.save_params(filename=checkpoint_path)
+            logger.info(
+                'complete save checkpoints.',
+                show_type=logger.LOG_STYLE.DEFAULT,
+                forground=logger.LOG_FRONT_COLOR.RED,
+                background=logger.LOG_BACK_COLOR.DEFAULT
+            )
+
+            ## eval
+            # if (epoch + 1) % opts.eval_interval == 0:
+            #     logger.info('begin evaluating ...')
+            #     logger.info('complete evaluating.')
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+if __name__ == '__main__':
+
+    opts = Config()
+    train_v1(opts=opts)
